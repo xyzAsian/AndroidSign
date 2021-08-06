@@ -121,7 +121,7 @@ static inline void init_eocd(End_Of_Central_Directory* eocd, void* file_start, i
 } 
 
 int main(int argc, const char* args[]) {
-    args[1] = "/Users/a1/Desktop/apksigning/sleepin-release-signed.1.apk";
+    // args[1] = "/Users/a1/Desktop/apksigning/sleepin-release-signed.1.apk";
     argc = 2;
     const char* apkpath = args[1];
     if(argc < 2 || argc > 2 || endswith(apkpath, ".apk") != 0) {
@@ -132,7 +132,7 @@ int main(int argc, const char* args[]) {
     // fopen(args[0], "r+");
     int fd = open(apkpath, O_RDONLY, 0);
     if(fd<0){
-        printf("Open apkfile error!");
+        printf("Open apkfile error : %s\n",apkpath);
         return 0;
     }
 
@@ -230,6 +230,6 @@ int main(int argc, const char* args[]) {
 	{
 		printf("%02x",decrypt[i]);
 	}
-
+    printf("\n");
     return 0;
 }
