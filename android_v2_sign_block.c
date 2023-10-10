@@ -1,9 +1,9 @@
 /**
- * @file android_v2_sign_block.c
+ * @file android_v3_sign_block.c
  * @author yazhou.xie
  * @brief 
  * @version 0.1
- * @date 2021-02-20
+ * @data 2023-10-08
  * 
  * @copyright Copyright (c) 2021
  * 
@@ -31,13 +31,16 @@ char[0x333]          certificate content
 uint64 0xff8        签名分块大小
 APK Sig Block 42    v2签名Magic
  */
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "tool/md5.c"
+#include "tool/base64.c"
 
 #define EOCD_SIZE 22
 #define EOCD 0x06054b50
@@ -84,31 +87,42 @@ typedef struct {
 } APK_SIGN_BLOCK_42;
 
 typedef struct {
-    uint32_t signer_len;
-    uint32_t signer_len_;
-    uint32_t signer_data_len;
-    uint32_t signer_data_len_;
-    uint32_t digests_len;
     uint32_t signature_algorithm_ID;
     uint32_t digest_len;
-    unsigned char* digest;
-} ASB_Singer;
+} ASB_singer_signeddata_digest;
 
-typedef struct {
-    uint32_t certificates_len;
-    uint32_t certificates_len_;
-    uint32_t certificate_len;
-    unsigned char* certificate;
-} ASB_certificate;
-
-int endswith(const char* str, const char* suffix) {
+int endswith(const char* str, const char* suffix) 
+{
     if( strcmp( (str + strlen(str) - strlen(suffix)), suffix) == 0) {
         return 0;
     }
     return -1;
 }
 
-static inline void init_eocd(End_Of_Central_Directory* eocd, void* file_start, int32_t file_size) {
+static inline void printData(unsigned char* data, uint32_t data_len)
+{
+    for(int i=0; i<data_len; i++) {
+		printf("%02x",data[i]);
+	}
+    printf("\n");
+}
+
+static inline void printMd5(unsigned char* data, uint32_t data_len)
+{
+    unsigned char digest_decrypt[16]; 
+    MD5_CTX md51;
+	MD5_Init(&md51);         		
+	MD5_Update(&md51, data, data_len);
+	MD5_Final(digest_decrypt, &md51);
+    for(int i=0;i<16;i++) {
+		printf("%02x",digest_decrypt[i]);
+	}
+    printf("\n");
+}
+
+
+static inline void init_eocd(End_Of_Central_Directory* eocd, void* file_start, int32_t file_size) 
+{
     char* eocd_start = file_start + (file_size - EOCD_SIZE);
     memcpy(&eocd->signature,         eocd_start, sizeof(eocd->signature));        eocd_start+= sizeof(eocd->signature);
     memcpy(&eocd->disk_num,          eocd_start, sizeof(eocd->disk_num));         eocd_start+= sizeof(eocd->disk_num);
@@ -120,8 +134,244 @@ static inline void init_eocd(End_Of_Central_Directory* eocd, void* file_start, i
     memcpy(&eocd->comment_len,       eocd_start, sizeof(eocd->comment_len));      eocd_start+= sizeof(eocd->comment_len);
 } 
 
+static inline void parseASBAttributesV2(void* start)
+{
+    //带长度前缀的 additional attributes
+}
+
+static inline size_t parseASBDigests(void* start, void* digest_start)
+{
+    void* current = digest_start;
+
+    uint32_t digest_len;
+    memcpy(&digest_len, current, sizeof(uint32_t));
+    printf("\t- digest_len=%x\n", digest_len);
+    current += sizeof(uint32_t);
+
+    uint32_t signature_algorithm_ID;
+    memcpy(&signature_algorithm_ID, current, sizeof(uint32_t));
+    printf("\t- signature_algorithm_ID=%x\n", signature_algorithm_ID);
+    current += sizeof(uint32_t);
+
+    uint32_t data_len;
+    memcpy(&data_len, current, sizeof(uint32_t));
+    printf("\t- data_len=%x\n", data_len);
+    current += sizeof(uint32_t);
+
+    unsigned char digest[data_len];
+    memcpy(digest, current, data_len); 
+    printf("\t- digest MD5 :");
+    printMd5(digest, data_len);
+    current += data_len;
+    
+    return digest_len + sizeof(uint32_t);
+}
+
+static inline size_t parseASBCertificates(void* start, void* certificate_start)
+{
+    void* current = certificate_start;
+
+    uint32_t data_len;
+    memcpy(&data_len, current, sizeof(uint32_t));
+    printf("\t- certificate data_len=%x\n", data_len);
+    current += sizeof(uint32_t);
+
+    unsigned char digest[data_len];
+    memcpy(digest, current, data_len); 
+    printf("\t- certificate MD5 :");
+    printMd5(digest, data_len);
+    current += data_len;
+
+    return data_len + sizeof(uint32_t);
+}
+
+static inline size_t parseASBAttributes(void* start, void* attribute_start)
+{
+    void* current = attribute_start;
+
+    uint32_t attribute_data_len;
+    memcpy(&attribute_data_len, current, sizeof(uint32_t));
+    printf("\t- attribute data_len=%x\n", attribute_data_len);
+    current += sizeof(uint32_t);
+    
+    uint32_t attribute_id;
+    memcpy(&attribute_id, current, sizeof(uint32_t));
+    printf("\t- attribute id=%x\n", attribute_id);
+    current += sizeof(uint32_t);
+
+    uint32_t attribute_value_len = attribute_data_len - sizeof(uint32_t);
+    printf("\t- attribute value len=%x\n", attribute_value_len);
+
+    unsigned char attribute_value[attribute_value_len];
+    memset(attribute_value, 0, sizeof(attribute_value));
+    memcpy(attribute_value, current, attribute_value_len);
+    printf("\t- attribute value=");
+    printData(attribute_value, attribute_value_len);
+    current += attribute_value_len;
+
+    return attribute_data_len + sizeof(uint32_t);
+}
+
+//带长度前缀的 signed data
+static inline size_t parseASBSignedData(void* start, void* signeddata_start, uint16_t level)
+{
+    
+    //带长度前缀的 digests（带长度前缀）序列
+    void* digests_start = signeddata_start;
+    uint32_t digests_total_len;
+    memcpy(&digests_total_len, digests_start, sizeof(uint32_t));
+    printf("digests_total_len=%x\n", digests_total_len);
+
+    void* digest_item_start = digests_start + sizeof(uint32_t);
+    void* digest_item_end = digest_item_start + digests_total_len;
+    while (digest_item_start < digest_item_end) {
+        uint32_t _len = parseASBDigests(start, digest_item_start);
+        digest_item_start += _len;
+        // printf("digest_item_start=%p digest_item_end=%p _len=%x\n", digest_item_start, digest_item_end, _len);
+    }
+
+    //带长度前缀的 X.509 certificates 序列：
+    void* certificates_start = digests_start + digests_total_len + sizeof(uint32_t);
+    uint32_t certificates_total_len;
+    memcpy(&certificates_total_len, certificates_start, sizeof(uint32_t));
+    printf("certificates_total_len=%x\n", certificates_total_len);
+
+    void* certificate_item_start = certificates_start + sizeof(uint32_t);
+    void* current = certificate_item_start;
+    void* certificate_item_end = certificate_item_start + certificates_total_len;
+    while (certificate_item_start < certificate_item_end) {
+        uint32_t _len = parseASBCertificates(start, certificate_item_start);
+        certificate_item_start += _len;
+        // printf("certificate_item_start=%p certificate_item_end=%p _len=%x\n", certificate_item_start, certificate_item_end, _len);
+    }
+
+    // 带长度前缀的 additional attributes（带长度前缀）序列
+    void* attributes_start = certificates_start + certificates_total_len + sizeof(uint32_t);
+    uint32_t attributes_total_len;
+    memcpy(&attributes_total_len, attributes_start, sizeof(uint32_t));
+    printf("attributes_total_len=%x\n", attributes_total_len);
+
+    void* attribute_item_start = attributes_start + sizeof(uint32_t);
+    void* current2 = attribute_item_start;
+    void* attribute_item_end = attribute_item_start + attributes_total_len;
+    while (attribute_item_start < attribute_item_end) {
+        uint32_t _len = parseASBAttributes(start, attribute_item_start);
+        attribute_item_start += _len;
+        // printf("attribute_item_start=%p attribute_item_end=%p _len=%x\n", attribute_item_start, attribute_item_end, _len);
+    }
+
+    return digests_total_len + sizeof(uint32_t) + certificates_total_len + sizeof(uint32_t) + attributes_total_len + sizeof(uint32_t) ;
+}
+
+// signature item
+static inline size_t parseASBSignature(void* start, void* signature)
+{
+    void* current = signature;
+
+    uint32_t signature_len;
+    memcpy(&signature_len, current, sizeof(uint32_t));
+    printf("\t- signature_len=%x\n", signature_len);
+    current += sizeof(uint32_t);
+
+    uint32_t signature_algorithm_ID;
+    memcpy(&signature_algorithm_ID, current, sizeof(signature_algorithm_ID));
+    printf("\t- signature_algorithm_ID=%x\n", signature_algorithm_ID);
+    current += sizeof(uint32_t);
+
+    uint32_t data_len;
+    memcpy(&data_len, current, sizeof(uint32_t));
+    printf("\t- signature_data_len=%x\n", data_len);
+    current += sizeof(uint32_t);
+
+    unsigned char digest[data_len];
+    memcpy(digest, current, data_len); 
+    printf("\t- signature MD5 :");
+    printMd5(digest, data_len);
+    current += data_len;
+
+    return signature_len + sizeof(uint32_t);
+}
+
+static inline void parseASBSigner(void* start, void* value_start, uint16_t level)
+{
+    // 带长度前缀的 signer, 实际上可能多个，这里偷懒只取第一个
+    void * asb_signer_start = value_start;
+    uint32_t signer_total_len = 0, signer_len = 0;
+    memcpy(&signer_total_len, asb_signer_start, sizeof(uint32_t));
+    printf("signer_total_len=%x\n", signer_total_len);
+    asb_signer_start += sizeof(uint32_t);
+
+    
+    void* signer_start = asb_signer_start;
+    // uint32_t signer_size = (signer_total_len-sizeof(uint32_t))/signer_len;
+    void* signer_end = signer_start + signer_total_len;
+    while (signer_start < signer_end) {
+        
+        memcpy(&signer_len, signer_start, sizeof(uint32_t));
+        printf("signer_len=%x\n", signer_len);
+
+        void* signeddata_start = signer_start + sizeof(uint32_t);
+        // 带长度前缀的 signed data
+        uint32_t signeddata_total_len=0;
+        memcpy(&signeddata_total_len, signeddata_start, sizeof(uint32_t));
+        printf("signeddata_total_len=%x\n", signeddata_total_len);
+
+        void* signeddata_item_start = signeddata_start + sizeof(uint32_t);
+        void* signeddata_item_end = signeddata_item_start + signeddata_total_len - sizeof(uint32_t);
+        while (signeddata_item_start < signeddata_item_end) {
+            uint32_t _len = parseASBSignedData(start, signeddata_item_start, level);
+            signeddata_item_start += _len;
+            // printf("signeddata_item_start=%p signeddata_item_end=%p _len=%x\n", signeddata_item_start, signeddata_item_end, _len);
+        }
+
+        /*
+        if (level == 3) {
+            // V3 Block
+            uint32_t minSDK=0;
+            memcpy(&minSDK, signed_data_start, sizeof(uint32_t));
+            printf("minSDK=%x\n", minSDK);
+            signed_data_start += sizeof(uint32_t);
+
+            uint32_t maxSDK=0;
+            memcpy(&maxSDK, signed_data_start, sizeof(uint32_t));
+            printf("maxSDK=%x\n", maxSDK);
+            signed_data_start += sizeof(uint32_t);
+        }
+        */
+
+        void* signature_start = signeddata_start + signeddata_total_len + sizeof(uint32_t);
+        //带长度前缀的 signatures（带长度前缀）序列：
+        uint32_t signatures_total_len;
+        memcpy(&signatures_total_len, signature_start, sizeof(uint32_t));
+        printf("signatures_total_len=%x\n", signatures_total_len);
+
+        void* signature_item_start = signature_start + sizeof(uint32_t);
+        void* signature_item_end = signature_item_start + signatures_total_len;
+        while (signature_item_start < signature_item_end) {
+            uint32_t _len = parseASBSignature(start, signature_item_start);
+            signature_item_start += _len;
+            // printf("signature_item_start=%p signature_item_end=%p _len=%d\n", signature_item_start, signature_item_end, _len);
+        }
+        
+        void* publickey_start = signature_start + signatures_total_len + sizeof(uint32_t);
+        //带长度前缀的 public key
+        uint32_t publickey_len;
+        memcpy(&publickey_len, publickey_start, sizeof(uint32_t));
+        printf("publickey_len=%x\n", publickey_len);
+        publickey_start += sizeof(uint32_t);
+        unsigned char publickey[publickey_len];
+        memcpy(publickey, publickey_start, publickey_len); 
+        printf("publickey MD5 :");
+        printMd5(publickey, publickey_len);
+
+        signer_start += sizeof(uint32_t);
+        signer_start += signer_len;
+        printf("signer_start=%p signer_end=%p\n", signer_start, signer_end);
+    }
+}
+
 int main(int argc, const char* args[]) {
-    // args[1] = "/Users/a1/Desktop/apksigning/sleepin-release-signed.1.apk";
+    // args[1] = "./sleepin-release-signed.1.rotate.2.protect.signed.apk";
     argc = 2;
     const char* apkpath = args[1];
     if(argc < 2 || argc > 2 || endswith(apkpath, ".apk") != 0) {
@@ -150,7 +400,7 @@ int main(int argc, const char* args[]) {
 
     printf("EndDir size is %d, offset is %d\n", eocd.directory_size, eocd.directory_offset);
 
-    // 读取v2签名块偏移
+    // 读取签名块偏移
     const void* cd_start = start + eocd.directory_offset;
     APK_SIGN_BLOCK_42 apk_sign_block;
     memcpy(&apk_sign_block.signature2,      cd_start-sizeof(apk_sign_block.signature2),     sizeof(apk_sign_block.signature2));     cd_start -= sizeof(apk_sign_block.signature2);
@@ -159,77 +409,40 @@ int main(int argc, const char* args[]) {
 
     if(apk_sign_block.signature1 != APK_SIGN_BLOCK_42_1 || apk_sign_block.signature2 != APK_SIGN_BLOCK_42_2) {
         printf("Apk signature block 42 incorrect : signature1[0x%llx] signature2[0x%llx]\n", apk_sign_block.signature1, apk_sign_block.signature2);
+        printf("Find V2 signature block error, Pls check apk file.\n");
         return -1;
     }
 
     printf("Apk signature block 42 size_of_blcok is 0x%llx\n", apk_sign_block.size_of_blcok);
 
-    //读取v2签名分块ID
+    //读取v3签名分块ID
     void * block_start = start + eocd.directory_offset - apk_sign_block.size_of_blcok;
-    uint64_t block_id;
-    memcpy(&block_id, block_start, sizeof(block_id));
-    printf("block id is 0x%llx\n", block_id);
-    block_start += sizeof(block_id);
-    
-    uint32_t apk_v2_sign_block_id;
-    memcpy(&apk_v2_sign_block_id, block_start, sizeof(apk_v2_sign_block_id));
-    printf("apk_v2_sign_block_id id is 0x%x\n", apk_v2_sign_block_id);
-    if(apk_v2_sign_block_id != 0x7109871a) {
-        //没有找到v2签名分块ID
+
+    uint64_t block_size = 0;
+    uint32_t block_id = 0;
+    while (block_start < start + eocd.directory_offset) {
+        block_size = 0;
+        memcpy(&block_size, block_start, sizeof(block_size));
+        block_start += sizeof(block_size);
+
+        block_id = 0;
+        memcpy(&block_id, block_start, sizeof(block_id));
+        block_start += sizeof(block_id);
+        
+        if (block_id == 0x7109871a) {
+            //V2 签名块
+            printf("Find V2 Block: offset[%lx] size[%llx] ID[%x]\n", (block_start-start), block_size, block_id);
+            parseASBSigner(start, block_start, 2);
+        } else if(block_id == 0xf05368c0) {
+            //V3签名块
+            printf("Find V3 Block: offset[%lx] size[%llx] ID[%x]\n", (block_start-start), block_size, block_id);
+            // parseASBSigner(start, block_start, 3);
+        } else {
+            //unknow
+            printf("Unknow Block: offset[%lx] size[%llx] ID[%x]\n", (block_start-start), block_size, block_id);
+            break;
+        }
+        block_start += (block_size - sizeof(block_id));
     }
-
-    block_start += sizeof(apk_v2_sign_block_id);
-
-    void *  asb_signer_start = block_start;
-    ASB_Singer asb_signer;
-    memcpy(&asb_signer.signer_len,              asb_signer_start,        sizeof(asb_signer.signer_len));             asb_signer_start += sizeof(asb_signer.signer_len);
-    memcpy(&asb_signer.signer_len_,             asb_signer_start,        sizeof(asb_signer.signer_len_));            asb_signer_start += sizeof(asb_signer.signer_len_);
-    memcpy(&asb_signer.signer_data_len,         asb_signer_start,        sizeof(asb_signer.signer_data_len));        asb_signer_start += sizeof(asb_signer.signer_data_len);
-    memcpy(&asb_signer.signer_data_len_,        asb_signer_start,        sizeof(asb_signer.signer_data_len_));       asb_signer_start += sizeof(asb_signer.signer_data_len_);
-    memcpy(&asb_signer.digests_len,             asb_signer_start,        sizeof(asb_signer.digests_len));            asb_signer_start += sizeof(asb_signer.digests_len);
-    memcpy(&asb_signer.signature_algorithm_ID,  asb_signer_start,        sizeof(asb_signer.signature_algorithm_ID)); asb_signer_start += sizeof(asb_signer.signature_algorithm_ID);
-    memcpy(&asb_signer.digest_len,              asb_signer_start,        sizeof(asb_signer.digest_len));             asb_signer_start += sizeof(asb_signer.digest_len);
-    unsigned char digest[asb_signer.digest_len];
-    memcpy(digest,asb_signer_start,asb_signer.digest_len); asb_signer_start += asb_signer.digest_len;
-    asb_signer.digest = digest;
-
-    printf("长度前缀signer[%x] 长度前缀signer_data[%x] 长度前缀digests[%x] signature_algorithm_ID[%x] 长度前缀digest[%x] digest MD5 :", 
-        asb_signer.signer_len, asb_signer.signer_data_len, asb_signer.digests_len, asb_signer.signature_algorithm_ID, asb_signer.digest_len);
-    unsigned char digest_decrypt[16]; 
-    MD5_CTX md51;
-	MD5_Init(&md51);         		
-	MD5_Update(&md51, digest, asb_signer.digest_len);
-	MD5_Final(digest_decrypt, &md51);
-    for(int i=0;i<16;i++)
-	{
-		printf("%02x",digest_decrypt[i]);
-	}
-    printf("\n");
-
-    /**
-     * @brief 
-     * uint32 长度前缀 certificates
-     * uint32 长度前缀 certificate
-     */
-    void * asb_certificate_start = block_start + sizeof(asb_signer.signer_len) + sizeof(asb_signer.signer_len_) + sizeof(asb_signer.signer_data_len) + sizeof(asb_signer.signer_data_len_) + asb_signer.signer_data_len_;
-    ASB_certificate asb_certificate;
-    memcpy(&asb_certificate.certificates_len,   asb_certificate_start,        sizeof(asb_certificate.certificates_len));      asb_certificate_start += sizeof(asb_certificate.certificates_len);
-    memcpy(&asb_certificate.certificate_len,    asb_certificate_start,        sizeof(asb_certificate.certificate_len));       asb_certificate_start += sizeof(asb_certificate.certificate_len);
-    unsigned char certificate[asb_certificate.certificate_len];
-    memcpy(certificate,asb_certificate_start,asb_certificate.certificate_len); //asb_certificate_start += asb_certificate.certificate_len;
-    asb_certificate.certificate = certificate;
-
-    unsigned char decrypt[16];
-    MD5_CTX ctx;
-    MD5_Init(&ctx); 
-    MD5_Update(&ctx, asb_certificate.certificate, asb_certificate.certificate_len);
-    MD5_Final(decrypt, &ctx);
-
-	printf("长度前缀 X.509 certificates[%x] 长度前缀 X.509 certificate[%x] MD5 certificate : ",asb_certificate.certificates_len, asb_certificate.certificate_len);
-    for(int i=0;i<16;i++)
-	{
-		printf("%02x",decrypt[i]);
-	}
-    printf("\n");
     return 0;
 }
